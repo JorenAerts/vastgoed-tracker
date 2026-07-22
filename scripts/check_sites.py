@@ -4,10 +4,13 @@
 import difflib
 import hashlib
 import json
+import re
 import textwrap
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime, parsedate_to_datetime
+from html import escape as html_escape
 from pathlib import Path
 
 import requests
@@ -31,7 +34,19 @@ HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    )
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "nl-BE,nl;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
 }
 
 
@@ -49,41 +64,76 @@ def save_json(path, data):
 
 
 def fetch(url):
-    """Return page text, or None if the site can't be reached (after 1 retry)."""
+    """Return page text, or None if the site can't be reached (after 1 retry).
+
+    Uses a shared session so any cookie a bot-protection layer (e.g. Cloudflare)
+    sets on the first attempt is sent back on the retry.
+    """
+    session = requests.Session()
+    session.headers.update(HEADERS)
     for attempt in range(2):
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+            resp = session.get(url, timeout=TIMEOUT)
             if resp.status_code >= 400:
                 if attempt == 0:
+                    time.sleep(3)
                     continue
                 return None
             return resp.text
         except requests.RequestException:
             if attempt == 0:
+                time.sleep(3)
                 continue
             return None
     return None
+
+
+CONTROL_CHARS_RE = re.compile(
+    "[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x84\x86-\x9f]"
+)
+
+
+def sanitize_xml_text(text):
+    """Strip characters XML 1.0 (and lxml) refuse to store as element text."""
+    return CONTROL_CHARS_RE.sub("", text)
 
 
 def extract_text(html):
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(STRIP_TAGS):
         tag.decompose()
-    return soup.get_text(separator=" ", strip=True)
+    text = soup.get_text(separator=" ", strip=True)
+    return sanitize_xml_text(text)
 
 
-def diff_snippet(old_text, new_text, max_lines=12, max_chars=1000):
-    old_lines = textwrap.wrap(old_text, 100)
-    new_lines = textwrap.wrap(new_text, 100)
+ADDED_STYLE = "color:#0a7a0a;background:#eaffea;padding:2px 6px;margin:1px 0;font-family:monospace;white-space:pre-wrap;border-radius:3px;"
+REMOVED_STYLE = "color:#b00020;background:#ffecec;padding:2px 6px;margin:1px 0;font-family:monospace;white-space:pre-wrap;border-radius:3px;"
+
+
+def diff_snippet_html(name, old_text, new_text, max_lines=14, max_chars=4000):
+    old_lines = textwrap.wrap(sanitize_xml_text(old_text), 100)
+    new_lines = textwrap.wrap(sanitize_xml_text(new_text), 100)
     diff = difflib.unified_diff(old_lines, new_lines, lineterm="")
     changed = [
         line for line in diff
         if line[:1] in ("+", "-") and not line.startswith(("+++", "---"))
     ]
+
+    intro = f"<p>Wijziging gedetecteerd op <strong>{html_escape(name)}</strong>:</p>"
+
     if not changed:
-        return "Wijziging gedetecteerd (geen leesbare tekstdiff)."
-    snippet = "\n".join(changed[:max_lines])
-    return snippet[:max_chars]
+        return intro + "<p>(geen leesbare tekstdiff)</p>"
+
+    rows = []
+    for line in changed[:max_lines]:
+        sign, text = line[0], html_escape(line[1:].strip())
+        style = ADDED_STYLE if sign == "+" else REMOVED_STYLE
+        rows.append(f'<div style="{style}">{sign} {text}</div>')
+
+    html_body = intro + "".join(rows)
+    if len(html_body) > max_chars:
+        html_body = html_body[:max_chars] + "…</div>"
+    return html_body
 
 
 def slugify(name):
@@ -169,8 +219,8 @@ def main():
                         "title": f"Kon {name} niet meer bereiken",
                         "link": url,
                         "description": (
-                            f"{name} is nu {fail_streak} dagen op rij niet bereikbaar "
-                            "(timeout, blokkering of serverfout)."
+                            f"<p><strong>{html_escape(name)}</strong> is nu {fail_streak} dagen "
+                            "op rij niet bereikbaar (timeout, blokkering of serverfout).</p>"
                         ),
                         "pub_date": now,
                     }
@@ -195,7 +245,7 @@ def main():
             print(f"[OK] {name}: geen wijziging")
             continue
 
-        description = diff_snippet(entry.get("text", ""), text)
+        description = diff_snippet_html(name, entry.get("text", ""), text)
         new_items.append(
             {
                 "guid": f"{slugify(name)}-{now.isoformat()}",
